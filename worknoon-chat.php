@@ -10,10 +10,20 @@
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain: worknoon-chat
  * Domain Path: /languages
+ * Requires at least: 5.8
+ * Requires PHP: 7.4
  */
 
 if (!defined('ABSPATH')) {
     exit;
+}
+
+// Check PHP version
+if (version_compare(PHP_VERSION, '7.4', '<')) {
+    add_action('admin_notices', function() {
+        echo '<div class="error"><p><strong>Worknoon Chat:</strong> Requires PHP 7.4 or higher. Your current PHP version is ' . PHP_VERSION . '</p></div>';
+    });
+    return;
 }
 
 define('WORKNOON_CHAT_VERSION', '1.0.0');
