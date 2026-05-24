@@ -1,0 +1,489 @@
+/*
+Theme Name: Worknoon Chat Storefront
+Theme URI: https://worknoon.com
+Description: Child theme of Storefront with integrated Worknoon Chat functionality. Includes floating chat widget, AJAX messaging, WooCommerce order sync, and product-based chat context.
+Author: Worknoon
+Author URI: https://worknoon.com
+Template: storefront
+Version: 1.0.0
+License: GNU General Public License v2 or later
+License URI: http://www.gnu.org/licenses/gpl-2.0.html
+Text Domain: worknoon-chat-storefront
+*/
+
+/* Import parent theme styles */
+@import url('../storefront/style.css');
+
+/* Worknoon Chat Widget Styles */
+.worknoon-chat-widget {
+    --chat-primary-color: #4f46e5;
+    --chat-secondary-color: #10b981;
+    --chat-bg-color: #ffffff;
+    --chat-text-color: #1f2937;
+    --chat-border-color: #e5e7eb;
+    --chat-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+/* Floating Action Button */
+.worknoon-chat-fab {
+    position: fixed;
+    bottom: 30px;
+    right: 30px;
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--chat-primary-color), #7c3aed);
+    color: white;
+    border: none;
+    cursor: pointer;
+    box-shadow: var(--chat-shadow);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    transition: all 0.3s ease;
+    animation: pulse 2s infinite;
+}
+
+.worknoon-chat-fab:hover {
+    transform: scale(1.1);
+    box-shadow: 0 6px 30px rgba(79, 70, 229, 0.4);
+}
+
+.worknoon-chat-fab svg {
+    width: 28px;
+    height: 28px;
+}
+
+@keyframes pulse {
+    0%, 100% {
+        box-shadow: 0 4px 20px rgba(79, 70, 229, 0.3);
+    }
+    50% {
+        box-shadow: 0 4px 30px rgba(79, 70, 229, 0.5);
+    }
+}
+
+/* Chat Container */
+.worknoon-chat-container {
+    position: fixed;
+    bottom: 100px;
+    right: 30px;
+    width: 380px;
+    max-width: calc(100vw - 40px);
+    height: 500px;
+    max-height: calc(100vh - 140px);
+    background: var(--chat-bg-color);
+    border-radius: 16px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+    display: flex;
+    flex-direction: column;
+    z-index: 9998;
+    overflow: hidden;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(20px) scale(0.95);
+}
+
+.worknoon-chat-container.active {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0) scale(1);
+}
+
+/* Chat Header */
+.worknoon-chat-header {
+    background: linear-gradient(135deg, var(--chat-primary-color), #7c3aed);
+    color: white;
+    padding: 16px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.worknoon-chat-header h3 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.worknoon-chat-header .status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    opacity: 0.9;
+}
+
+.worknoon-chat-header .status-dot {
+    width: 8px;
+    height: 8px;
+    background: #10b981;
+    border-radius: 50%;
+    animation: blink 2s infinite;
+}
+
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+.worknoon-chat-close {
+    background: rgba(255, 255, 255, 0.2);
+    border: none;
+    color: white;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s;
+}
+
+.worknoon-chat-close:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
+
+/* Chat Messages */
+.worknoon-chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    background: #f9fafb;
+}
+
+.worknoon-chat-messages::-webkit-scrollbar {
+    width: 6px;
+}
+
+.worknoon-chat-messages::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.worknoon-chat-messages::-webkit-scrollbar-thumb {
+    background: #d1d5db;
+    border-radius: 3px;
+}
+
+/* Message Bubbles */
+.chat-message {
+    margin-bottom: 16px;
+    display: flex;
+    flex-direction: column;
+}
+
+.chat-message.own {
+    align-items: flex-end;
+}
+
+.chat-message-bubble {
+    max-width: 80%;
+    padding: 12px 16px;
+    border-radius: 16px;
+    font-size: 14px;
+    line-height: 1.5;
+    word-wrap: break-word;
+}
+
+.chat-message:not(.own) .chat-message-bubble {
+    background: white;
+    color: var(--chat-text-color);
+    border-bottom-left-radius: 4px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.chat-message.own .chat-message-bubble {
+    background: linear-gradient(135deg, var(--chat-primary-color), #7c3aed);
+    color: white;
+    border-bottom-right-radius: 4px;
+}
+
+.chat-message-meta {
+    font-size: 11px;
+    color: #9ca3af;
+    margin-top: 4px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.chat-message.own .chat-message-meta {
+    text-align: right;
+}
+
+/* Typing Indicator */
+.chat-typing-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 16px;
+    background: white;
+    border-radius: 16px;
+    border-bottom-left-radius: 4px;
+    width: fit-content;
+    margin-bottom: 16px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.typing-dots {
+    display: flex;
+    gap: 4px;
+}
+
+.typing-dots span {
+    width: 6px;
+    height: 6px;
+    background: #9ca3af;
+    border-radius: 50%;
+    animation: typingBounce 1.4s infinite ease-in-out both;
+}
+
+.typing-dots span:nth-child(1) {
+    animation-delay: -0.32s;
+}
+
+.typing-dots span:nth-child(2) {
+    animation-delay: -0.16s;
+}
+
+@keyframes typingBounce {
+    0%, 80%, 100% {
+        transform: scale(0);
+    }
+    40% {
+        transform: scale(1);
+    }
+}
+
+/* Chat Input */
+.worknoon-chat-input {
+    padding: 16px 20px;
+    background: white;
+    border-top: 1px solid var(--chat-border-color);
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+}
+
+.worknoon-chat-input textarea {
+    flex: 1;
+    border: 1px solid var(--chat-border-color);
+    border-radius: 12px;
+    padding: 12px 16px;
+    font-size: 14px;
+    resize: none;
+    min-height: 44px;
+    max-height: 120px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.worknoon-chat-input textarea:focus {
+    border-color: var(--chat-primary-color);
+}
+
+.worknoon-chat-send {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    background: var(--chat-primary-color);
+    color: white;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    flex-shrink: 0;
+}
+
+.worknoon-chat-send:hover {
+    background: #4338ca;
+    transform: scale(1.05);
+}
+
+.worknoon-chat-send:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+}
+
+/* Empty State */
+.chat-empty-state {
+    text-align: center;
+    padding: 40px 20px;
+    color: #9ca3af;
+}
+
+.chat-empty-state svg {
+    width: 48px;
+    height: 48px;
+    margin-bottom: 12px;
+    opacity: 0.5;
+}
+
+/* Product Chat Button on Product Page */
+.product-chat-button {
+    margin-top: 20px;
+    padding: 16px;
+    background: #f3f4f6;
+    border-radius: 12px;
+    text-align: center;
+}
+
+.product-chat-button h4 {
+    margin: 0 0 12px 0;
+    font-size: 16px;
+    color: var(--chat-text-color);
+}
+
+.product-chat-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 24px;
+    background: var(--chat-primary-color);
+    color: white;
+    border-radius: 8px;
+    text-decoration: none;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+
+.product-chat-btn:hover {
+    background: #4338ca;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
+}
+
+/* Order Chat Section */
+.order-chat-section {
+    margin-top: 30px;
+    padding: 24px;
+    background: #f9fafb;
+    border-radius: 12px;
+    border: 1px solid var(--chat-border-color);
+}
+
+.order-chat-section h3 {
+    margin: 0 0 16px 0;
+    font-size: 18px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* Responsive */
+@media (max-width: 480px) {
+    .worknoon-chat-container {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: 100%;
+        height: 100%;
+        max-width: none;
+        max-height: none;
+        border-radius: 0;
+        z-index: 10000;
+    }
+
+    .worknoon-chat-fab {
+        bottom: 20px;
+        right: 20px;
+        width: 56px;
+        height: 56px;
+    }
+}
+
+/* Dark Mode Support */
+@media (prefers-color-scheme: dark) {
+    .worknoon-chat-widget {
+        --chat-bg-color: #1f2937;
+        --chat-text-color: #f9fafb;
+        --chat-border-color: #374151;
+    }
+
+    .worknoon-chat-messages {
+        background: #111827;
+    }
+
+    .chat-message:not(.own) .chat-message-bubble,
+    .chat-typing-indicator {
+        background: #374151;
+        color: #f9fafb;
+    }
+
+    .worknoon-chat-input {
+        background: #1f2937;
+    }
+
+    .worknoon-chat-input textarea {
+        background: #374151;
+        color: #f9fafb;
+        border-color: #4b5563;
+    }
+}
+
+/* Admin Bar Adjustment */
+body.admin-bar .worknoon-chat-fab {
+    bottom: 70px;
+}
+
+body.admin-bar .worknoon-chat-container {
+    bottom: 140px;
+}
+
+/* Loading State */
+.chat-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+}
+
+.chat-loading-spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid #e5e7eb;
+    border-top-color: var(--chat-primary-color);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* Notification Badge */
+.chat-notification-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    width: 20px;
+    height: 20px;
+    background: #ef4444;
+    color: white;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: bounce 0.5s;
+}
+
+@keyframes bounce {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.2); }
+}
