@@ -161,14 +161,57 @@
 
         startPolling: function() {
             var self = this;
+            // Only poll for new messages when viewing a conversation, not the conversation list
             this.pollingInterval = setInterval(function() {
-                if ($('.worknoon-admin-conversations').length) {
-                    self.loadAllConversations();
+                // Only poll messages when actively viewing a conversation
+                if (self.currentConversation && $('#worknoon-admin-chat-messages').length &&
+                    $('#worknoon-admin-chat-panel').is(':visible')) {
+                    self.loadNewMessagesOnly(self.currentConversation._id);
                 }
-                if (self.currentConversation && $('#worknoon-admin-chat-messages').length) {
-                    self.loadMessagesForConversation(self.currentConversation._id);
+            }, 10000); // Poll every 10 seconds instead of 5
+        },
+
+        loadNewMessagesOnly: function(conversationId) {
+            var self = this;
+
+            // Build request data
+            var requestData = {
+                action: 'worknoon_chat_proxy',
+                nonce: worknoonChatAdmin.nonce,
+                endpoint: '/messages/conversations/' + conversationId,
+                method: 'GET',
+                data: JSON.stringify({})
+            };
+
+            // If no JWT token but we have master token, use external endpoint
+            if (!this.jwtToken && worknoonChatAdmin.masterToken) {
+                requestData.endpoint = '/external/conversations/' + conversationId + '/messages';
+            }
+
+            $.ajax({
+                url: ajaxurl,
+                type: 'POST',
+                data: requestData,
+                success: function(response) {
+                    if (response.success && response.data) {
+                        var messagesData = response.data;
+                        // Handle paginated response from external API
+                        if (response.data.data && Array.isArray(response.data.data.messages)) {
+                            messagesData = response.data.data.messages;
+                        } else if (response.data.data && Array.isArray(response.data.data)) {
+                            messagesData = response.data.data;
+                        }
+
+                        var newMessages = Array.isArray(messagesData) ? messagesData : (messagesData.messages || []);
+
+                        // Only update if there are new messages
+                        if (newMessages.length > self.messages.length) {
+                            self.messages = newMessages;
+                            self.renderAdminMessages();
+                        }
+                    }
                 }
-            }, 5000);
+            });
         },
 
         stopPolling: function() {
@@ -217,6 +260,39 @@
                 }
             });
 
+            // Check Master Token status
+            if (worknoonChatAdmin.masterToken) {
+                $.ajax({
+                    url: ajaxurl,
+                    type: 'POST',
+                    data: {
+                        action: 'worknoon_test_master_token',
+                        nonce: worknoonChatAdmin.nonce
+                    },
+                    success: function(response) {
+                        var $tokenStatus = $('#worknoon-master-token-status');
+                        if (response.success) {
+                            $tokenStatus.removeClass('worknoon-status-checking worknoon-status-error')
+                                      .addClass('worknoon-status-ok')
+                                      .text('Valid');
+                        } else {
+                            $tokenStatus.removeClass('worknoon-status-checking worknoon-status-ok')
+                                      .addClass('worknoon-status-error')
+                                      .text('Invalid');
+                        }
+                    },
+                    error: function() {
+                        $('#worknoon-master-token-status').removeClass('worknoon-status-checking worknoon-status-ok')
+                                                        .addClass('worknoon-status-error')
+                                                        .text('Error');
+                    }
+                });
+            } else {
+                $('#worknoon-master-token-status').removeClass('worknoon-status-checking worknoon-status-ok')
+                                                .addClass('worknoon-status-error')
+                                                .text('Not Configured');
+            }
+
             // Check WebSocket status
             var $socketStatus = $('#worknoon-socket-status');
             if (this.socketConnected) {
@@ -233,21 +309,34 @@
         loadRecentConversations: function() {
             var self = this;
 
+            // Build request data - include master token if no JWT token available
+            var requestData = {
+                action: 'worknoon_chat_proxy',
+                nonce: worknoonChatAdmin.nonce,
+                endpoint: '/conversations',
+                method: 'GET',
+                data: JSON.stringify({})
+            };
+
+            // If no JWT token but we have master token, use external endpoint
+            if (!this.jwtToken && worknoonChatAdmin.masterToken) {
+                console.log('[Admin] No JWT token, using master token fallback for recent conversations');
+                requestData.endpoint = '/external/conversations';
+            }
+
             $.ajax({
                 url: ajaxurl,
                 type: 'POST',
-                data: {
-                    action: 'worknoon_chat_proxy',
-                    nonce: worknoonChatAdmin.nonce,
-                    endpoint: '/conversations',
-                    method: 'GET',
-                    data: JSON.stringify({})
-                },
+                data: requestData,
                 success: function(response) {
                     console.log('[Admin] Recent conversations response:', response);
                     if (response.success && response.data) {
-                        // Backend returns data directly (array) or in data property
-                        self.conversations = Array.isArray(response.data) ? response.data : (response.data.conversations || []);
+                        // Handle paginated response from external API
+                        var conversationsData = response.data;
+                        if (response.data.data && Array.isArray(response.data.data)) {
+                            conversationsData = response.data.data;
+                        }
+                        self.conversations = Array.isArray(conversationsData) ? conversationsData : (conversationsData.conversations || []);
                         self.renderRecentConversations();
                     }
                 }
@@ -298,28 +387,44 @@
 
             $('#worknoon-all-conversations').html('<p class="worknoon-loading">Loading conversations...</p>');
 
+            // Build request data - include master token if no JWT token available
+            var requestData = {
+                action: 'worknoon_chat_proxy',
+                nonce: worknoonChatAdmin.nonce,
+                endpoint: '/conversations',
+                method: 'GET',
+                data: JSON.stringify({})
+            };
+
+            // If no JWT token but we have master token, the PHP will use master token fallback
+            // But we need to tell PHP to use external endpoint
+            if (!this.jwtToken && worknoonChatAdmin.masterToken) {
+                console.log('[Admin] No JWT token, using master token fallback for conversations');
+                requestData.endpoint = '/external/conversations';
+            }
+
             $.ajax({
                 url: ajaxurl,
                 type: 'POST',
-                data: {
-                    action: 'worknoon_chat_proxy',
-                    nonce: worknoonChatAdmin.nonce,
-                    endpoint: '/conversations',
-                    method: 'GET',
-                    data: JSON.stringify({})
-                },
+                data: requestData,
                 success: function(response) {
                     console.log('[Admin] All conversations response:', response);
                     if (response.success && response.data) {
                         // Backend returns data directly (array) or in data property
-                        self.conversations = Array.isArray(response.data) ? response.data : (response.data.conversations || []);
+                        var conversationsData = response.data;
+                        // Handle paginated response from external API
+                        if (response.data.data && Array.isArray(response.data.data)) {
+                            conversationsData = response.data.data;
+                        }
+                        self.conversations = Array.isArray(conversationsData) ? conversationsData : (conversationsData.conversations || []);
                         self.renderConversationsList();
                     } else {
-                        $('#worknoon-all-conversations').html('<p class="worknoon-error">Failed to load conversations.</p>');
+                        $('#worknoon-all-conversations').html('<p class="worknoon-error">Failed to load conversations: ' + (response.data || 'Unknown error') + '</p>');
                     }
                 },
-                error: function() {
-                    $('#worknoon-all-conversations').html('<p class="worknoon-error">Error loading conversations.</p>');
+                error: function(xhr, status, error) {
+                    console.error('[Admin] Error loading conversations:', error);
+                    $('#worknoon-all-conversations').html('<p class="worknoon-error">Error loading conversations: ' + error + '</p>');
                 }
             });
         },
@@ -452,21 +557,37 @@
 
             $('#worknoon-admin-chat-messages').html('<p class="worknoon-loading">Loading messages...</p>');
 
+            // Build request data - include master token if no JWT token available
+            var requestData = {
+                action: 'worknoon_chat_proxy',
+                nonce: worknoonChatAdmin.nonce,
+                endpoint: '/messages/conversations/' + conversationId,
+                method: 'GET',
+                data: JSON.stringify({})
+            };
+
+            // If no JWT token but we have master token, use external endpoint
+            if (!this.jwtToken && worknoonChatAdmin.masterToken) {
+                console.log('[Admin] No JWT token, using master token fallback for messages');
+                requestData.endpoint = '/external/conversations/' + conversationId + '/messages';
+            }
+
             $.ajax({
                 url: ajaxurl,
                 type: 'POST',
-                data: {
-                    action: 'worknoon_chat_proxy',
-                    nonce: worknoonChatAdmin.nonce,
-                    endpoint: '/messages/conversations/' + conversationId,
-                    method: 'GET',
-                    data: JSON.stringify({})
-                },
+                data: requestData,
                 success: function(response) {
                     console.log('[Admin] Messages response:', response);
                     if (response.success && response.data) {
                         // Backend returns messages directly (array) or in messages property
-                        self.messages = Array.isArray(response.data) ? response.data : (response.data.messages || []);
+                        var messagesData = response.data;
+                        // Handle paginated response from external API
+                        if (response.data.data && Array.isArray(response.data.data.messages)) {
+                            messagesData = response.data.data.messages;
+                        } else if (response.data.data && Array.isArray(response.data.data)) {
+                            messagesData = response.data.data;
+                        }
+                        self.messages = Array.isArray(messagesData) ? messagesData : (messagesData.messages || []);
                         self.renderAdminMessages();
                     }
                 },
@@ -692,12 +813,20 @@
             return div.innerHTML;
         },
 
-        // ==================== LEGACY METHODS ====================
+        // ==================== API TEST METHODS ====================
 
         initApiTest: function() {
-            $('#test-api-connection').on('click', function() {
+            var self = this;
+
+            console.log('WorknoonChatAdmin: initApiTest called');
+
+            // Test basic backend connection
+            $(document).on('click', '#test-api-connection', function(e) {
+                e.preventDefault();
                 var $button = $(this);
                 var $result = $('#api-test-result');
+
+                console.log('Test API Connection clicked');
 
                 $button.prop('disabled', true).text('Testing...');
                 $result.html('<span class="worknoon-spinner"></span>');
@@ -720,7 +849,41 @@
                         $result.html('<span style="color: red;">✗ Connection error: ' + error + '</span>');
                     },
                     complete: function() {
-                        $button.prop('disabled', false).text('Test Connection');
+                        $button.prop('disabled', false).text('Test Backend Connection');
+                    }
+                });
+            });
+
+            // Test master token authentication
+            $(document).on('click', '#test-master-token', function(e) {
+                e.preventDefault();
+                var $button = $(this);
+                var $result = $('#master-token-result');
+
+                console.log('Test Master Token clicked');
+
+                $button.prop('disabled', true).text('Testing...');
+                $result.html('<span class="worknoon-spinner"></span>');
+
+                $.ajax({
+                    url: ajaxurl,
+                    type: 'POST',
+                    data: {
+                        action: 'worknoon_test_master_token',
+                        nonce: worknoonChatAdmin.nonce
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            $result.html('<span style="color: green;">✓ ' + response.data + '</span>');
+                        } else {
+                            $result.html('<span style="color: red;">✗ ' + (response.data || 'Master token test failed') + '</span>');
+                        }
+                    },
+                    error: function(xhr, status, error) {
+                        $result.html('<span style="color: red;">✗ Test error: ' + error + '</span>');
+                    },
+                    complete: function() {
+                        $button.prop('disabled', false).text('Test Master Token Auth');
                     }
                 });
             });
