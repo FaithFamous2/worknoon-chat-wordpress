@@ -1,175 +1,201 @@
-# Worknoon Chat - WordPress Plugin
+# Worknoon Chat WordPress Plugin
 
-A WordPress plugin that integrates real-time chat functionality into eCommerce platforms, enabling communication between customers, support agents, designers, and merchants.
+WordPress plugin for integrating Worknoon Chat system with WooCommerce and any WordPress site.
 
 ## Features
 
-### Core Features
-- **Custom Post Type**: Chat Session management within WordPress admin
-- **REST API**: Full REST API for chat operations
-- **AJAX Messaging**: Real-time messaging via AJAX polling
-- **Shortcodes**: Easy integration with `[worknoon_chat]` and `[worknoon_chat_button]`
-- **User Roles**: Support for customers, agents, designers, and merchants
+- **Custom Post Type**: Chat Session management in WordPress admin
+- **Shortcodes**: `[worknoon_chat]` and `[worknoon_chat_button]` for easy integration
+- **REST API Integration**: Connects to Node.js backend API
+- **Socket.IO Real-time**: Live messaging with fallback to polling
+- **WooCommerce Integration**: Chat on product and order pages
+- **Guest Chat Support**: Optional anonymous chat functionality
+- **User Sync**: Automatic WordPress user synchronization with backend
 
-### WooCommerce Integration
-- **Order Chat**: Automatic chat session creation for each order
-- **Product Chat**: Chat button on product pages for pre-sales questions
-- **Context-Aware**: Chat includes order/product context
+## Requirements
 
-### Admin Features
-- **Chat Management**: View and manage all chat sessions in WordPress admin
-- **Settings Page**: Configure colors, position, notifications
-- **Email Notifications**: Automatic email alerts for new messages
-- **Online Status**: Track agent availability
-
-### Frontend Features
-- **Floating Widget**: Collapsible chat widget on all pages
-- **Responsive Design**: Mobile-friendly interface
-- **Dark Mode**: Automatic dark mode support
-- **Typing Indicators**: Show when someone is typing
-- **File Attachments**: Support for images and documents
+- WordPress 5.8+
+- PHP 7.4+
+- Node.js Backend running (see worknoon-chat-backend)
+- WooCommerce (optional, for eCommerce features)
 
 ## Installation
 
-1. Download the plugin files
-2. Upload to `/wp-content/plugins/worknoon-chat/`
-3. Activate the plugin through the 'Plugins' menu in WordPress
-4. Configure settings under Chat Sessions > Settings
+### 1. Install the Plugin
+
+1. Copy the `worknoon-chat-wordpress` folder to `/wp-content/plugins/`
+2. Activate the plugin in WordPress Admin → Plugins
+3. Go to Chat Sessions → Settings to configure
+
+### 2. Configure Backend Connection
+
+In WordPress Admin, go to **Chat Sessions → Settings**:
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Backend API Endpoint | Node.js API URL | `http://localhost:5000/api` |
+| Socket.IO Endpoint | Socket server URL | `http://localhost:5000` |
+| Enable Chat | Show widget on frontend | Enabled |
+| Allow Guest Chat | Anonymous users can chat | Disabled |
+| Primary Color | Widget accent color | `#4f46e5` |
+| Widget Position | Bottom-left or right | `bottom-right` |
+
+### 3. Start the Backend Server
+
+```bash
+# In worknoon-chat-backend directory
+npm install
+npm run dev
+# or
+npm start
+```
 
 ## Usage
 
-### Basic Shortcode
-Add the chat widget to any page or post:
+### Shortcodes
+
+**Full Chat Widget:**
 ```
 [worknoon_chat]
 ```
 
-### Chat Button
-Add a chat start button:
+**Chat Widget with specific conversation:**
 ```
-[worknoon_chat_button text="Chat with Support"]
+[worknoon_chat conversation_id="CONVERSATION_ID"]
+```
+
+**Chat Button (opens widget):**
+```
+[worknoon_chat_button text="Chat with us" type="buyer-agent"]
 ```
 
 ### WooCommerce Integration
+
 The plugin automatically adds chat to:
-- Order detail pages (for order-specific support)
-- Product pages (for pre-sales questions)
+- Product pages (customer can ask about product)
+- Order pages (order-specific support chat)
 
-## Configuration
+### Template Functions
 
-### Settings
-- **Enable Chat**: Toggle chat widget on/off
-- **Guest Chat**: Allow non-logged-in users to chat
-- **Email Notifications**: Send email alerts for new messages
-- **Primary Color**: Customize the chat widget color
-- **Widget Position**: Bottom-left or bottom-right
-- **External API**: Connect to external Node.js chat server
-
-### User Roles
-The plugin works with these WordPress roles:
-- **Customer**: Can initiate chats and communicate
-- **Support Agent**: Can accept and manage chat sessions
-- **Shop Manager**: Full chat management access
-- **Administrator**: Full access to all features
-
-## REST API Endpoints
-
-### Authentication
-All endpoints require WordPress authentication (nonce).
-
-### Endpoints
-
-#### Get Chat Sessions
-```
-GET /wp-json/worknoon-chat/v1/sessions
+```php
+// Check if chat is enabled
+if (worknoon_chat_is_enabled()) {
+    // Display custom chat trigger
+    echo do_shortcode('[worknoon_chat_button text="Support"]');
+}
 ```
 
-#### Create Chat Session
-```
-POST /wp-json/worknoon-chat/v1/sessions
-Body: { "title": "Support Chat", "type": "support", "agent_id": 123 }
-```
+## How It Works
 
-#### Get Messages
-```
-GET /wp-json/worknoon-chat/v1/sessions/{id}/messages
-```
+### User Authentication Flow
 
-#### Send Message
-```
-POST /wp-json/worknoon-chat/v1/sessions/{id}/messages
-Body: { "content": "Hello!" }
-```
+1. WordPress user logs in
+2. Plugin syncs user to Node.js backend via `/auth/register` or `/auth/login`
+3. Backend returns JWT tokens stored in user meta
+4. Frontend uses tokens for API authentication
+5. Socket.IO connects with JWT for real-time messaging
 
-#### Get Available Agents
-```
-GET /wp-json/worknoon-chat/v1/agents
-```
+### Message Flow
 
-#### Get Settings
-```
-GET /wp-json/worknoon-chat/v1/settings
-```
+1. User sends message via widget
+2. If Socket.IO connected: emits `send_message` event
+3. If offline: sends via REST API `/messages` endpoint
+4. Backend broadcasts to all participants via Socket.IO
+5. Messages stored in MongoDB
+
+### Guest Chat Flow
+
+1. Guest clicks chat button
+2. Prompted for name and email
+3. Guest user registered in backend
+4. Conversation created
+5. Chat proceeds normally
+
+## API Endpoints Used
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/auth/register` | POST | Register new user |
+| `/auth/login` | POST | Authenticate user |
+| `/auth/refresh` | POST | Refresh JWT token |
+| `/conversations` | GET | List user's conversations |
+| `/conversations` | POST | Create new conversation |
+| `/conversations/:id` | GET | Get conversation details |
+| `/messages` | POST | Send message |
+| `/users` | GET | List available agents |
 
 ## File Structure
 
 ```
 worknoon-chat-wordpress/
 ├── worknoon-chat.php          # Main plugin file
-├── README.md                   # This file
 ├── assets/
 │   ├── css/
-│   │   └── chat-widget.css    # Frontend styles
+│   │   ├── chat-widget.css    # Frontend styles
+│   │   └── admin.css          # Admin styles
 │   └── js/
-│       └── chat-widget.js     # Frontend JavaScript
+│       ├── chat-widget.js     # Frontend JavaScript
+│       └── admin.js           # Admin JavaScript
+├── themes/
+│   └── worknoon-chat-storefront/  # Optional child theme
+└── README.md
 ```
 
-## Technologies Used
+## Troubleshooting
 
-- **PHP**: WordPress plugin architecture
-- **JavaScript**: jQuery-based frontend interactions
-- **WordPress REST API**: Backend communication
-- **AJAX**: Real-time message polling
-- **CSS3**: Responsive styling with CSS variables
+### Connection Issues
 
-## Integration with External Chat Server
+1. **Test API Connection**: In Settings, click "Test Connection"
+2. **Check CORS**: Ensure backend allows your WordPress domain
+3. **Verify Backend**: Confirm Node.js server is running
+4. **Check Console**: Look for JavaScript errors in browser console
 
-To connect with the Node.js chat server:
+### Common Problems
 
-1. Go to Chat Sessions > Settings
-2. Enter the external API endpoint URL
-3. The plugin will use the external server for real-time features
+**Widget not appearing:**
+- Check "Enable Chat" setting is on
+- Verify shortcode is placed correctly
+- Check for JavaScript errors
 
-## Browser Support
+**Messages not sending:**
+- Verify user is logged in (or guest chat enabled)
+- Check JWT token is valid (re-login to refresh)
+- Confirm backend is running and accessible
 
-- Chrome (latest)
-- Firefox (latest)
-- Safari (latest)
-- Edge (latest)
-- Mobile browsers (iOS Safari, Chrome Mobile)
+**Real-time not working:**
+- Socket.IO falls back to polling automatically
+- Check firewall isn't blocking WebSocket port
+- Verify `socketUrl` in settings is correct
+
+### Debug Mode
+
+Add to `wp-config.php`:
+```php
+define('WP_DEBUG', true);
+define('WP_DEBUG_LOG', true);
+```
+
+Check `/wp-content/debug.log` for API communication logs.
 
 ## Security
 
-- WordPress nonce verification on all AJAX requests
-- Capability checks for admin functions
-- Data sanitization and escaping
-- Prepared statements for database queries
+- All API requests use JWT authentication
+- Nonces verify AJAX requests
+- Data sanitized with `sanitize_text_field()`, `sanitize_email()`
+- SQL injection prevented via `$wpdb->prepare()`
+- XSS protection via `esc_html()`, `esc_attr()`
 
 ## Changelog
 
 ### 1.0.0
 - Initial release
-- Custom post type for chat sessions
-- REST API endpoints
+- Custom Post Type for chat sessions
+- REST API integration with Node.js backend
+- Socket.IO real-time messaging
 - WooCommerce integration
-- AJAX messaging system
-- Responsive chat widget
-- Email notifications
+- Guest chat support
+- Admin settings page
 
 ## License
 
 GPL v2 or later
-
-## Support
-
-For support, please contact: careers@worknoon.com

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Worknoon Chat
  * Plugin URI: https://worknoon.com
- * Description: Real-time chat integration for eCommerce platforms. Enables communication between customers, agents, designers, and merchants.
+ * Description: Real-time chat integration for eCommerce platforms. Connects to Worknoon Chat Node.js backend.
  * Version: 1.0.0
  * Author: Worknoon
  * Author URI: https://worknoon.com
@@ -36,6 +36,8 @@ define('WORKNOON_CHAT_PLUGIN_URL', plugin_dir_url(__FILE__));
 class Worknoon_Chat {
 
     private static $instance = null;
+    private $api_base_url = '';
+    private $jwt_token = '';
 
     public static function get_instance() {
         if (null === self::$instance) {
@@ -49,11 +51,12 @@ class Worknoon_Chat {
     }
 
     private function init() {
-        // Register post type
-        add_action('init', array($this, 'register_chat_session_post_type'));
+        // Get API settings
+        $settings = get_option('worknoon_chat_settings', array());
+        $this->api_base_url = rtrim($settings['api_endpoint'] ?? 'http://localhost:5001/api', '/');
 
-        // Register REST API endpoints
-        add_action('rest_api_init', array($this, 'register_rest_routes'));
+        // Register post type for local chat session storage
+        add_action('init', array($this, 'register_chat_session_post_type'));
 
         // Admin menu
         add_action('admin_menu', array($this, 'add_admin_menu'));
@@ -66,11 +69,24 @@ class Worknoon_Chat {
         add_shortcode('worknoon_chat', array($this, 'render_chat_widget'));
         add_shortcode('worknoon_chat_button', array($this, 'render_chat_button'));
 
-        // AJAX handlers
-        add_action('wp_ajax_worknoon_send_message', array($this, 'ajax_send_message'));
-        add_action('wp_ajax_nopriv_worknoon_send_message', array($this, 'ajax_nopriv_send_message'));
-        add_action('wp_ajax_worknoon_get_messages', array($this, 'ajax_get_messages'));
-        add_action('wp_ajax_nopriv_worknoon_get_messages', array($this, 'ajax_nopriv_get_messages'));
+        // AJAX handlers for WordPress backend proxy
+        add_action('wp_ajax_worknoon_chat_proxy', array($this, 'ajax_proxy_to_backend'));
+        add_action('wp_ajax_nopriv_worknoon_chat_proxy', array($this, 'ajax_nopriv_proxy'));
+
+        // File upload handler
+        add_action('wp_ajax_worknoon_chat_upload', array($this, 'ajax_handle_file_upload'));
+        add_action('wp_ajax_nopriv_worknoon_chat_upload', array($this, 'ajax_handle_file_upload'));
+
+        // Test connection handler
+        add_action('wp_ajax_worknoon_test_connection', array($this, 'ajax_test_connection'));
+
+        // Manual user sync handler
+        add_action('wp_ajax_worknoon_sync_users', array($this, 'ajax_sync_users'));
+
+        // User sync hooks
+        add_action('user_register', array($this, 'sync_user_to_backend'), 10, 1);
+        add_action('profile_update', array($this, 'sync_user_to_backend'), 10, 1);
+        add_action('wp_login', array($this, 'authenticate_with_backend'), 10, 2);
 
         // WooCommerce integration
         if (class_exists('WooCommerce')) {
@@ -113,332 +129,381 @@ class Worknoon_Chat {
             'menu_position'         => 30,
             'menu_icon'             => 'dashicons-format-chat',
             'supports'              => array('title', 'author', 'custom-fields'),
-            'show_in_rest'          => true,
-            'rest_base'             => 'chat-sessions',
+            'show_in_rest'          => false,
         );
 
         register_post_type('chat_session', $args);
     }
 
     /**
-     * Register REST API Routes
+     * Find user in backend by email
      */
-    public function register_rest_routes() {
-        register_rest_route('worknoon-chat/v1', '/sessions', array(
-            'methods'               => 'GET',
-            'callback'              => array($this, 'rest_get_sessions'),
-            'permission_callback'   => array($this, 'rest_permission_check'),
-        ));
-
-        register_rest_route('worknoon-chat/v1', '/sessions', array(
-            'methods'               => 'POST',
-            'callback'              => array($this, 'rest_create_session'),
-            'permission_callback'   => array($this, 'rest_permission_check'),
-        ));
-
-        register_rest_route('worknoon-chat/v1', '/sessions/(?P<id>\d+)/messages', array(
-            'methods'               => 'GET',
-            'callback'              => array($this, 'rest_get_messages'),
-            'permission_callback'   => array($this, 'rest_permission_check'),
-        ));
-
-        register_rest_route('worknoon-chat/v1', '/sessions/(?P<id>\d+)/messages', array(
-            'methods'               => 'POST',
-            'callback'              => array($this, 'rest_send_message'),
-            'permission_callback'   => array($this, 'rest_permission_check'),
-        ));
-
-        register_rest_route('worknoon-chat/v1', '/agents', array(
-            'methods'               => 'GET',
-            'callback'              => array($this, 'rest_get_agents'),
-            'permission_callback'   => '__return_true',
-        ));
-
-        register_rest_route('worknoon-chat/v1', '/settings', array(
-            'methods'               => 'GET',
-            'callback'              => array($this, 'rest_get_settings'),
-            'permission_callback'   => '__return_true',
-        ));
-    }
-
-    /**
-     * REST API Permission Check
-     */
-    public function rest_permission_check() {
-        return is_user_logged_in() || $this->allow_guest_chat();
-    }
-
-    /**
-     * Check if guest chat is allowed
-     */
-    private function allow_guest_chat() {
-        $settings = get_option('worknoon_chat_settings', array());
-        return !empty($settings['allow_guest_chat']);
-    }
-
-    /**
-     * REST: Get Chat Sessions
-     */
-    public function rest_get_sessions($request) {
-        $user_id = get_current_user_id();
-
+    private function find_backend_user_by_email($email, $admin_token = null) {
+        // Try to get users list and find by email
+        // First try with admin token if available, otherwise try without auth
         $args = array(
-            'post_type'         => 'chat_session',
-            'posts_per_page'    => -1,
-            'meta_query'        => array(
-                array(
-                    'key'       => '_chat_participants',
-                    'value'     => $user_id,
-                    'compare'   => 'LIKE',
-                ),
+            'method'    => 'GET',
+            'timeout'   => 30,
+            'headers'   => array(
+                'Content-Type'  => 'application/json',
+                'Accept'        => 'application/json',
             ),
         );
 
-        $sessions = get_posts($args);
-        $data = array();
-
-        foreach ($sessions as $session) {
-            $data[] = $this->format_session_data($session);
+        if ($admin_token) {
+            $args['headers']['Authorization'] = 'Bearer ' . $admin_token;
         }
 
-        return rest_ensure_response($data);
+        $response = wp_remote_request($this->api_base_url . '/users', $args);
+
+        if (is_wp_error($response)) {
+            return null;
+        }
+
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+
+        // Handle different response structures
+        if (!is_array($body)) {
+            return null;
+        }
+
+        $users = $body['data'] ?? $body;
+
+        if (!is_array($users)) {
+            return null;
+        }
+
+        // Handle nested users array
+        if (isset($users['users']) && is_array($users['users'])) {
+            $users = $users['users'];
+        }
+
+        // Ensure we have an array of users
+        if (!is_array($users)) {
+            return null;
+        }
+
+        foreach ($users as $backend_user) {
+            if (!is_array($backend_user) || !isset($backend_user['email'])) {
+                continue;
+            }
+            if (strcasecmp($backend_user['email'], $email) === 0) {
+                return $backend_user;
+            }
+        }
+
+        return null;
     }
 
     /**
-     * REST: Create Chat Session
+     * Sync WordPress user to Node.js backend
      */
-    public function rest_create_session($request) {
-        $params = $request->get_params();
-        $user_id = get_current_user_id();
+    public function sync_user_to_backend($user_id) {
+        $user = get_userdata($user_id);
+        if (!$user) return;
 
-        $session_data = array(
-            'post_title'    => sanitize_text_field($params['title'] ?? 'Chat Session'),
-            'post_type'     => 'chat_session',
-            'post_status'   => 'publish',
-            'post_author'   => $user_id,
+        // Check if already synced
+        $backend_user_id = get_user_meta($user_id, '_worknoon_backend_id', true);
+        $temp_password = get_user_meta($user_id, '_worknoon_temp_password', true);
+
+        // Determine role mapping
+        $wp_role = $user->roles[0] ?? 'customer';
+        $backend_role = $this->map_wordpress_role($wp_role);
+
+        // Generate password if not exists
+        if (empty($temp_password)) {
+            $temp_password = wp_generate_password(20, true, true);
+            update_user_meta($user_id, '_worknoon_temp_password', $temp_password);
+        }
+
+        $user_data = array(
+            'email'     => $user->user_email,
+            'name'      => $user->display_name,
+            'role'      => $backend_role,
+            'wordpress_id' => $user_id,
+            'password'  => $temp_password,
         );
 
-        $session_id = wp_insert_post($session_data);
-
-        if (is_wp_error($session_id)) {
-            return new WP_Error('create_failed', 'Failed to create chat session', array('status' => 500));
-        }
-
-        // Store participants
-        $participants = array($user_id);
-        if (!empty($params['agent_id'])) {
-            $participants[] = intval($params['agent_id']);
-        }
-
-        update_post_meta($session_id, '_chat_participants', $participants);
-        update_post_meta($session_id, '_chat_status', 'active');
-        update_post_meta($session_id, '_chat_type', sanitize_text_field($params['type'] ?? 'general'));
-
-        // Store WooCommerce context if available
-        if (!empty($params['order_id'])) {
-            update_post_meta($session_id, '_wc_order_id', intval($params['order_id']));
-        }
-        if (!empty($params['product_id'])) {
-            update_post_meta($session_id, '_wc_product_id', intval($params['product_id']));
-        }
-
-        return rest_ensure_response(array(
-            'id'    => $session_id,
-            'title' => $session_data['post_title'],
-            'status'=> 'active',
+        // First, try to login to see if user already exists with this password
+        $login_response = $this->make_backend_request('/auth/login', 'POST', array(
+            'email'    => $user->user_email,
+            'password' => $temp_password,
         ));
-    }
 
-    /**
-     * REST: Get Messages
-     */
-    public function rest_get_messages($request) {
-        $session_id = $request['id'];
-        $messages = get_post_meta($session_id, '_chat_messages', true);
+        if (!is_wp_error($login_response)) {
+            $login_code = wp_remote_retrieve_response_code($login_response);
+            $login_body = json_decode(wp_remote_retrieve_body($login_response), true);
 
-        if (!is_array($messages)) {
-            $messages = array();
+            // If login successful, store the tokens and user ID
+            if ($login_code === 200) {
+                $data = $login_body['data'] ?? $login_body;
+
+                if (!empty($data['user']['_id'])) {
+                    update_user_meta($user_id, '_worknoon_backend_id', $data['user']['_id']);
+                }
+                if (!empty($data['tokens']['accessToken'])) {
+                    update_user_meta($user_id, '_worknoon_jwt_token', $data['tokens']['accessToken']);
+                    update_user_meta($user_id, '_worknoon_refresh_token', $data['tokens']['refreshToken']);
+                }
+                delete_user_meta($user_id, '_worknoon_needs_password_reset');
+                return; // Successfully logged in, no need to register
+            }
         }
 
-        // Mark messages as read
-        $user_id = get_current_user_id();
-        $unread_key = '_chat_unread_' . $user_id;
-        delete_post_meta($session_id, $unread_key);
+        // Login failed, try to register
+        $response = $this->make_backend_request('/auth/register', 'POST', $user_data);
+        $status_code = wp_remote_retrieve_response_code($response);
 
-        return rest_ensure_response($messages);
+        if ($status_code === 409) {
+            // User already exists but password is wrong
+            // Try to find the user by email to get the correct ID
+            $backend_user = $this->find_backend_user_by_email($user->user_email);
+
+            if ($backend_user && !empty($backend_user['_id'])) {
+                // Found the user, update the stored ID
+                update_user_meta($user_id, '_worknoon_backend_id', $backend_user['_id']);
+
+                // Generate a new password and try to update the user
+                $new_password = wp_generate_password(20, true, true);
+                update_user_meta($user_id, '_worknoon_temp_password', $new_password);
+
+                // Try to update the user with new password
+                // This might fail if we don't have admin rights, but worth trying
+                $update_data = $user_data;
+                $update_data['password'] = $new_password;
+
+                $update_response = $this->make_backend_request(
+                    '/users/' . $backend_user['_id'],
+                    'PUT',
+                    $update_data
+                );
+
+                // Now try to login with the new password
+                $login_response2 = $this->make_backend_request('/auth/login', 'POST', array(
+                    'email'    => $user->user_email,
+                    'password' => $new_password,
+                ));
+
+                if (!is_wp_error($login_response2)) {
+                    $login_code2 = wp_remote_retrieve_response_code($login_response2);
+                    if ($login_code2 === 200) {
+                        $login_body2 = json_decode(wp_remote_retrieve_body($login_response2), true);
+                        $data2 = $login_body2['data'] ?? $login_body2;
+
+                        if (!empty($data2['tokens']['accessToken'])) {
+                            update_user_meta($user_id, '_worknoon_jwt_token', $data2['tokens']['accessToken']);
+                            update_user_meta($user_id, '_worknoon_refresh_token', $data2['tokens']['refreshToken']);
+                            delete_user_meta($user_id, '_worknoon_needs_password_reset');
+                            return;
+                        }
+                    }
+                }
+
+                // If we get here, we couldn't login even after update
+                // Mark for manual password reset
+                update_user_meta($user_id, '_worknoon_needs_password_reset', true);
+                error_log("Worknoon Chat: User {$user->user_email} exists in backend but password could not be updated. Manual reset required.");
+            } else {
+                error_log("Worknoon Chat: Could not find backend user with email {$user->user_email}");
+            }
+        }
+
+        if (!is_wp_error($response) && $status_code >= 200 && $status_code < 300) {
+            $body = json_decode(wp_remote_retrieve_body($response), true);
+            $response_data = $body['data'] ?? $body;
+
+            // Store backend user ID
+            if (!empty($response_data['user']['_id'])) {
+                update_user_meta($user_id, '_worknoon_backend_id', $response_data['user']['_id']);
+            } elseif (!empty($response_data['_id'])) {
+                update_user_meta($user_id, '_worknoon_backend_id', $response_data['_id']);
+            }
+
+            // If registration returns tokens, store them
+            if (!empty($response_data['tokens']['accessToken'])) {
+                update_user_meta($user_id, '_worknoon_jwt_token', $response_data['tokens']['accessToken']);
+                update_user_meta($user_id, '_worknoon_refresh_token', $response_data['tokens']['refreshToken']);
+                delete_user_meta($user_id, '_worknoon_needs_password_reset');
+            }
+        }
     }
 
     /**
-     * REST: Send Message
+     * Authenticate user with backend on WordPress login
      */
-    public function rest_send_message($request) {
-        $session_id = $request['id'];
-        $params = $request->get_params();
-        $user_id = get_current_user_id();
+    public function authenticate_with_backend($user_login, $user) {
+        // Always try to sync first - this will handle login or registration
+        $this->sync_user_to_backend($user->ID);
+    }
 
-        $message = array(
-            'id'            => uniqid('msg_'),
-            'sender_id'     => $user_id,
-            'sender_name'   => $this->get_user_display_name($user_id),
-            'content'       => sanitize_textarea_field($params['content']),
-            'timestamp'     => current_time('mysql'),
-            'attachments'   => !empty($params['attachments']) ? $params['attachments'] : array(),
+    /**
+     * Map WordPress role to backend role
+     */
+    private function map_wordpress_role($wp_role) {
+        $mapping = array(
+            'administrator'     => 'admin',
+            'shop_manager'      => 'agent',
+            'customer'          => 'customer',
+            'subscriber'        => 'customer',
+            'contributor'       => 'designer',
+            'author'            => 'merchant',
         );
 
-        $messages = get_post_meta($session_id, '_chat_messages', true);
-        if (!is_array($messages)) {
-            $messages = array();
+        return $mapping[$wp_role] ?? 'customer';
+    }
+
+    /**
+     * Make HTTP request to backend API
+     */
+    private function make_backend_request($endpoint, $method = 'GET', $data = null, $auth_token = null) {
+        $url = $this->api_base_url . $endpoint;
+
+        $args = array(
+            'method'    => $method,
+            'timeout'   => 30,
+            'headers'   => array(
+                'Content-Type'  => 'application/json',
+                'Accept'        => 'application/json',
+            ),
+        );
+
+        if ($auth_token) {
+            $args['headers']['Authorization'] = 'Bearer ' . $auth_token;
         }
 
-        $messages[] = $message;
-        update_post_meta($session_id, '_chat_messages', $messages);
+        if ($data && in_array($method, array('POST', 'PUT', 'PATCH'))) {
+            $args['body'] = json_encode($data);
+        }
 
-        // Update last activity
-        update_post_meta($session_id, '_chat_last_activity', current_time('mysql'));
+        return wp_remote_request($url, $args);
+    }
 
-        // Mark as unread for other participants
-        $participants = get_post_meta($session_id, '_chat_participants', true);
-        if (is_array($participants)) {
-            foreach ($participants as $participant_id) {
-                if ($participant_id != $user_id) {
-                    $unread_count = get_post_meta($session_id, '_chat_unread_' . $participant_id, true);
-                    $unread_count = intval($unread_count) + 1;
-                    update_post_meta($session_id, '_chat_unread_' . $participant_id, $unread_count);
+    /**
+     * AJAX proxy to backend API
+     */
+    public function ajax_proxy_to_backend() {
+        check_ajax_referer('worknoon_chat_nonce', 'nonce');
+
+        $endpoint = sanitize_text_field($_POST['endpoint'] ?? '');
+        $method = sanitize_text_field($_POST['method'] ?? 'GET');
+        $data = isset($_POST['data']) ? json_decode(stripslashes($_POST['data']), true) : array();
+        $token = isset($_POST['token']) ? sanitize_text_field($_POST['token']) : '';
+
+        // Use provided token (for guests) or get from user meta (for logged-in users)
+        $jwt_token = $token;
+        $user_id = get_current_user_id();
+        if (empty($jwt_token)) {
+            if ($user_id) {
+                $jwt_token = get_user_meta($user_id, '_worknoon_jwt_token', true);
+
+                if (!$jwt_token) {
+                    // Try to re-authenticate
+                    $this->authenticate_with_backend('', get_userdata($user_id));
+                    $jwt_token = get_user_meta($user_id, '_worknoon_jwt_token', true);
                 }
             }
         }
 
-        // Send email notification
-        $this->send_message_notification($session_id, $message);
-
-        return rest_ensure_response($message);
-    }
-
-    /**
-     * REST: Get Available Agents
-     */
-    public function rest_get_agents() {
-        $agents = get_users(array(
-            'role__in'  => array('administrator', 'shop_manager', 'support_agent'),
-            'fields'    => array('ID', 'display_name', 'user_email'),
-        ));
-
-        $data = array();
-        foreach ($agents as $agent) {
-            $data[] = array(
-                'id'        => $agent->ID,
-                'name'      => $agent->display_name,
-                'email'     => $agent->user_email,
-                'avatar'    => get_avatar_url($agent->ID),
-                'online'    => $this->is_user_online($agent->ID),
-            );
-        }
-
-        return rest_ensure_response($data);
-    }
-
-    /**
-     * REST: Get Plugin Settings
-     */
-    public function rest_get_settings() {
-        $settings = get_option('worknoon_chat_settings', array());
-
-        return rest_ensure_response(array(
-            'api_url'           => get_rest_url(null, 'worknoon-chat/v1'),
-            'ajax_url'          => admin_url('admin-ajax.php'),
-            'nonce'             => wp_create_nonce('worknoon_chat_nonce'),
-            'allow_guest_chat'  => !empty($settings['allow_guest_chat']),
-            'primary_color'     => $settings['primary_color'] ?? '#4f46e5',
-            'position'          => $settings['position'] ?? 'bottom-right',
-        ));
-    }
-
-    /**
-     * Format session data for API response
-     */
-    private function format_session_data($session) {
-        $participants = get_post_meta($session->ID, '_chat_participants', true);
-        $last_activity = get_post_meta($session->ID, '_chat_last_activity', true);
-
-        return array(
-            'id'            => $session->ID,
-            'title'         => $session->post_title,
-            'status'        => get_post_meta($session->ID, '_chat_status', true),
-            'type'          => get_post_meta($session->ID, '_chat_type', true),
-            'participants'  => $participants,
-            'last_activity' => $last_activity,
-            'created_at'    => $session->post_date,
-        );
-    }
-
-    /**
-     * Get user display name
-     */
-    private function get_user_display_name($user_id) {
-        $user = get_userdata($user_id);
-        return $user ? $user->display_name : 'Guest';
-    }
-
-    /**
-     * Check if user is online
-     */
-    private function is_user_online($user_id) {
-        $last_activity = get_user_meta($user_id, '_last_activity', true);
-        if (empty($last_activity)) {
-            return false;
-        }
-
-        $time_diff = time() - strtotime($last_activity);
-        return $time_diff < 300; // 5 minutes
-    }
-
-    /**
-     * Send message notification email
-     */
-    private function send_message_notification($session_id, $message) {
-        $settings = get_option('worknoon_chat_settings', array());
-        if (empty($settings['email_notifications'])) {
+        if (empty($jwt_token)) {
+            wp_send_json_error('Authentication required');
             return;
         }
 
-        $participants = get_post_meta($session_id, '_chat_participants', true);
-        if (!is_array($participants)) {
-            return;
+        $response = $this->make_backend_request($endpoint, $method, $data, $jwt_token);
+
+        if (is_wp_error($response)) {
+            wp_send_json_error($response->get_error_message());
         }
 
-        $session = get_post($session_id);
-        $subject = sprintf(__('New message in chat: %s', 'worknoon-chat'), $session->post_title);
+        $body = wp_remote_retrieve_body($response);
+        $status_code = wp_remote_retrieve_response_code($response);
 
-        foreach ($participants as $participant_id) {
-            if ($participant_id == $message['sender_id']) {
-                continue;
+        if ($status_code === 401) {
+            // Token expired, try refresh
+            $refresh_token = get_user_meta($user_id, '_worknoon_refresh_token', true);
+            if ($refresh_token) {
+                $refresh_response = $this->make_backend_request('/auth/refresh', 'POST', array(
+                    'refreshToken' => $refresh_token
+                ));
+
+                if (!is_wp_error($refresh_response)) {
+                    $refresh_body = json_decode(wp_remote_retrieve_body($refresh_response), true);
+                    if (!empty($refresh_body['data']['accessToken'])) {
+                        update_user_meta($user_id, '_worknoon_jwt_token', $refresh_body['data']['accessToken']);
+                        // Retry original request
+                        $response = $this->make_backend_request($endpoint, $method, $data, $refresh_body['data']['accessToken']);
+                        $body = wp_remote_retrieve_body($response);
+                    }
+                }
             }
-
-            $user = get_userdata($participant_id);
-            if (!$user) {
-                continue;
-            }
-
-            $body = sprintf(
-                __("You have a new message from %s:\n\n%s\n\nView chat: %s", 'worknoon-chat'),
-                $message['sender_name'],
-                $message['content'],
-                admin_url('post.php?post=' . $session_id . '&action=edit')
-            );
-
-            wp_mail($user->user_email, $subject, $body);
         }
+
+        // Parse backend response
+        $backend_data = json_decode($body, true);
+
+        // Backend returns: { success: true, message: "...", data: [...] }
+        // We need to pass the data directly to match frontend expectations
+        if (isset($backend_data['success']) && $backend_data['success'] && isset($backend_data['data'])) {
+            wp_send_json_success($backend_data['data']);
+        } else {
+            // Pass through the raw response for error cases
+            wp_send_json_success($backend_data);
+        }
+    }
+
+    /**
+     * AJAX proxy for non-logged in users (limited access)
+     */
+    public function ajax_nopriv_proxy() {
+        $settings = get_option('worknoon_chat_settings', array());
+        if (empty($settings['allow_guest_chat'])) {
+            wp_send_json_error('Guest chat not enabled');
+        }
+
+        // Limited endpoints for guests
+        $allowed_endpoints = array('/auth/register', '/auth/login');
+        $endpoint = sanitize_text_field($_POST['endpoint'] ?? '');
+
+        if (!in_array($endpoint, $allowed_endpoints)) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        $method = sanitize_text_field($_POST['method'] ?? 'POST');
+        $data = isset($_POST['data']) ? json_decode(stripslashes($_POST['data']), true) : array();
+
+        $response = $this->make_backend_request($endpoint, $method, $data);
+
+        if (is_wp_error($response)) {
+            wp_send_json_error($response->get_error_message());
+        }
+
+        $body = wp_remote_retrieve_body($response);
+        wp_send_json_success(json_decode($body, true));
     }
 
     /**
      * Enqueue frontend scripts
      */
     public function enqueue_frontend_scripts() {
-        // Only enqueue if chat is enabled
         $settings = get_option('worknoon_chat_settings', array());
         if (empty($settings['enable_chat'])) {
             return;
         }
+
+        // Skip if theme is handling the widget (theme has its own JS)
+        if (function_exists('worknoon_chat_storefront_enqueue_styles')) {
+            // Theme is active and will handle widget loading
+            return;
+        }
+
+        // Enqueue Socket.IO from CDN
+        wp_enqueue_script(
+            'socket-io',
+            'https://cdn.socket.io/4.7.2/socket.io.min.js',
+            array(),
+            '4.7.2',
+            true
+        );
 
         wp_enqueue_style(
             'worknoon-chat-style',
@@ -450,19 +515,32 @@ class Worknoon_Chat {
         wp_enqueue_script(
             'worknoon-chat-script',
             WORKNOON_CHAT_PLUGIN_URL . 'assets/js/chat-widget.js',
-            array('jquery'),
+            array('jquery', 'socket-io'),
             WORKNOON_CHAT_VERSION,
             true
         );
 
+        $user_id = get_current_user_id();
+        $jwt_token = $user_id ? get_user_meta($user_id, '_worknoon_jwt_token', true) : '';
+        $backend_id = $user_id ? get_user_meta($user_id, '_worknoon_backend_id', true) : '';
+
         wp_localize_script('worknoon-chat-script', 'worknoonChat', array(
-            'ajaxUrl'       => admin_url('admin-ajax.php'),
-            'restUrl'       => get_rest_url(null, 'worknoon-chat/v1'),
-            'nonce'         => wp_create_nonce('worknoon_chat_nonce'),
-            'userId'        => get_current_user_id(),
-            'userName'      => $this->get_user_display_name(get_current_user_id()),
-            'isLoggedIn'    => is_user_logged_in(),
-            'settings'      => $settings,
+            'ajaxUrl'           => admin_url('admin-ajax.php'),
+            'apiUrl'            => $this->api_base_url,
+            'nonce'             => wp_create_nonce('worknoon_chat_nonce'),
+            'userId'            => $user_id,
+            'backendUserId'     => $backend_id,
+            'userName'          => $user_id ? wp_get_current_user()->display_name : 'Guest',
+            'userEmail'         => $user_id ? wp_get_current_user()->user_email : '',
+            'isLoggedIn'        => is_user_logged_in(),
+            'jwtToken'          => $jwt_token,
+            'socketUrl'         => $settings['socket_endpoint'] ?? 'http://localhost:5001',
+            'loginUrl'          => wp_login_url(),
+            'settings'          => array(
+                'allowGuestChat'    => !empty($settings['allow_guest_chat']),
+                'primaryColor'      => $settings['primary_color'] ?? '#4f46e5',
+                'position'          => $settings['position'] ?? 'bottom-right',
+            ),
         ));
     }
 
@@ -470,14 +548,36 @@ class Worknoon_Chat {
      * Enqueue admin scripts
      */
     public function enqueue_admin_scripts($hook) {
-        if ('post.php' !== $hook && 'post-new.php' !== $hook) {
+        // Load on all Worknoon Chat admin pages
+        $worknoon_pages = array(
+            'toplevel_page_worknoon-chat-dashboard',
+            'worknoon-chat_page_worknoon-chat-conversations',
+            'worknoon-chat_page_worknoon-chat-users',
+            'worknoon-chat_page_worknoon-chat-analytics',
+            'worknoon-chat_page_worknoon-chat-settings',
+            'edit.php',
+            'post.php',
+            'post-new.php'
+        );
+
+        $is_worknoon_page = in_array($hook, $worknoon_pages, true);
+
+        // Also check if we're on chat session post type
+        $screen = get_current_screen();
+        $is_chat_session = ($screen && $screen->post_type === 'chat_session');
+
+        if (!$is_worknoon_page && !$is_chat_session) {
             return;
         }
 
-        $screen = get_current_screen();
-        if ($screen->post_type !== 'chat_session') {
-            return;
-        }
+        // Enqueue Socket.IO for real-time chat in admin
+        wp_enqueue_script(
+            'socket-io',
+            'https://cdn.socket.io/4.7.2/socket.io.min.js',
+            array(),
+            '4.7.2',
+            true
+        );
 
         wp_enqueue_style(
             'worknoon-chat-admin-style',
@@ -489,24 +589,531 @@ class Worknoon_Chat {
         wp_enqueue_script(
             'worknoon-chat-admin-script',
             WORKNOON_CHAT_PLUGIN_URL . 'assets/js/admin.js',
-            array('jquery'),
+            array('jquery', 'socket-io'),
             WORKNOON_CHAT_VERSION,
             true
         );
+
+        $settings = get_option('worknoon_chat_settings', array());
+        $user_id = get_current_user_id();
+        $jwt_token = $user_id ? get_user_meta($user_id, '_worknoon_jwt_token', true) : '';
+        $backend_id = $user_id ? get_user_meta($user_id, '_worknoon_backend_id', true) : '';
+
+        // Localize script with nonce and user data for AJAX
+        wp_localize_script('worknoon-chat-admin-script', 'worknoonChatAdmin', array(
+            'ajaxUrl'       => admin_url('admin-ajax.php'),
+            'nonce'         => wp_create_nonce('worknoon_chat_nonce'),
+            'socketUrl'     => $settings['socket_endpoint'] ?? 'http://localhost:5001',
+            'jwtToken'      => $jwt_token,
+            'backendUserId' => $backend_id,
+            'userName'      => $user_id ? wp_get_current_user()->display_name : '',
+            'userEmail'     => $user_id ? wp_get_current_user()->user_email : '',
+        ));
     }
 
     /**
      * Add admin menu
      */
     public function add_admin_menu() {
+        // Main Chat Dashboard
+        add_menu_page(
+            __('Worknoon Chat', 'worknoon-chat'),
+            __('Worknoon Chat', 'worknoon-chat'),
+            'manage_options',
+            'worknoon-chat-dashboard',
+            array($this, 'render_admin_dashboard'),
+            'dashicons-format-chat',
+            30
+        );
+
+        // Conversations List
         add_submenu_page(
-            'edit.php?post_type=chat_session',
-            __('Chat Settings', 'worknoon-chat'),
+            'worknoon-chat-dashboard',
+            __('All Conversations', 'worknoon-chat'),
+            __('All Conversations', 'worknoon-chat'),
+            'manage_options',
+            'worknoon-chat-conversations',
+            array($this, 'render_conversations_page')
+        );
+
+        // Chat Session CPT (existing)
+        add_submenu_page(
+            'worknoon-chat-dashboard',
+            __('Chat Sessions', 'worknoon-chat'),
+            __('Chat Sessions', 'worknoon-chat'),
+            'manage_options',
+            'edit.php?post_type=chat_session'
+        );
+
+        // Users Management
+        add_submenu_page(
+            'worknoon-chat-dashboard',
+            __('Chat Users', 'worknoon-chat'),
+            __('Chat Users', 'worknoon-chat'),
+            'manage_options',
+            'worknoon-chat-users',
+            array($this, 'render_users_page')
+        );
+
+        // Analytics/Reports
+        add_submenu_page(
+            'worknoon-chat-dashboard',
+            __('Analytics', 'worknoon-chat'),
+            __('Analytics', 'worknoon-chat'),
+            'manage_options',
+            'worknoon-chat-analytics',
+            array($this, 'render_analytics_page')
+        );
+
+        // Settings
+        add_submenu_page(
+            'worknoon-chat-dashboard',
+            __('Settings', 'worknoon-chat'),
             __('Settings', 'worknoon-chat'),
             'manage_options',
             'worknoon-chat-settings',
             array($this, 'render_settings_page')
         );
+    }
+
+    /**
+     * Render Admin Dashboard
+     */
+    public function render_admin_dashboard() {
+        // Ensure admin is authenticated with backend
+        $this->ensure_admin_authenticated();
+
+        $stats = $this->get_chat_statistics();
+        ?>
+        <div class="wrap worknoon-admin-dashboard">
+            <h1><?php _e('Worknoon Chat Dashboard', 'worknoon-chat'); ?></h1>
+
+            <div class="worknoon-stats-grid">
+                <div class="worknoon-stat-card">
+                    <div class="worknoon-stat-icon">💬</div>
+                    <div class="worknoon-stat-content">
+                        <h3><?php echo number_format($stats['total_conversations'] ?? 0); ?></h3>
+                        <p><?php _e('Total Conversations', 'worknoon-chat'); ?></p>
+                    </div>
+                </div>
+
+                <div class="worknoon-stat-card">
+                    <div class="worknoon-stat-icon">📩</div>
+                    <div class="worknoon-stat-content">
+                        <h3><?php echo number_format($stats['unread_messages'] ?? 0); ?></h3>
+                        <p><?php _e('Unread Messages', 'worknoon-chat'); ?></p>
+                    </div>
+                </div>
+
+                <div class="worknoon-stat-card">
+                    <div class="worknoon-stat-icon">👥</div>
+                    <div class="worknoon-stat-content">
+                        <h3><?php echo number_format($stats['active_users'] ?? 0); ?></h3>
+                        <p><?php _e('Active Users Today', 'worknoon-chat'); ?></p>
+                    </div>
+                </div>
+
+                <div class="worknoon-stat-card">
+                    <div class="worknoon-stat-icon">⏱️</div>
+                    <div class="worknoon-stat-content">
+                        <h3><?php echo esc_html($stats['avg_response_time'] ?? 'N/A'); ?></h3>
+                        <p><?php _e('Avg Response Time', 'worknoon-chat'); ?></p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="worknoon-dashboard-grid">
+                <div class="worknoon-dashboard-main">
+                    <div class="worknoon-card">
+                        <h2><?php _e('Recent Conversations', 'worknoon-chat'); ?></h2>
+                        <div id="worknoon-recent-conversations" class="worknoon-conversations-list">
+                            <p class="worknoon-loading"><?php _e('Loading...', 'worknoon-chat'); ?></p>
+                        </div>
+                        <p class="worknoon-view-all">
+                            <a href="<?php echo admin_url('admin.php?page=worknoon-chat-conversations'); ?>" class="button">
+                                <?php _e('View All Conversations', 'worknoon-chat'); ?>
+                            </a>
+                        </p>
+                    </div>
+                </div>
+
+                <div class="worknoon-dashboard-sidebar">
+                    <div class="worknoon-card">
+                        <h2><?php _e('Quick Actions', 'worknoon-chat'); ?></h2>
+                        <div class="worknoon-quick-actions">
+                            <a href="<?php echo admin_url('admin.php?page=worknoon-chat-conversations'); ?>" class="button button-primary">
+                                <?php _e('Open Chat Inbox', 'worknoon-chat'); ?>
+                            </a>
+                            <a href="<?php echo admin_url('admin.php?page=worknoon-chat-users'); ?>" class="button">
+                                <?php _e('Manage Users', 'worknoon-chat'); ?>
+                            </a>
+                            <a href="<?php echo admin_url('admin.php?page=worknoon-chat-settings'); ?>" class="button">
+                                <?php _e('Settings', 'worknoon-chat'); ?>
+                            </a>
+                        </div>
+                    </div>
+
+                    <div class="worknoon-card">
+                        <h2><?php _e('System Status', 'worknoon-chat'); ?></h2>
+                        <div class="worknoon-status-list">
+                            <div class="worknoon-status-item">
+                                <span class="worknoon-status-label"><?php _e('Backend API:', 'worknoon-chat'); ?></span>
+                                <span id="worknoon-api-status" class="worknoon-status-badge worknoon-status-checking">
+                                    <?php _e('Checking...', 'worknoon-chat'); ?>
+                                </span>
+                            </div>
+                            <div class="worknoon-status-item">
+                                <span class="worknoon-status-label"><?php _e('WebSocket:', 'worknoon-chat'); ?></span>
+                                <span id="worknoon-socket-status" class="worknoon-status-badge worknoon-status-checking">
+                                    <?php _e('Checking...', 'worknoon-chat'); ?>
+                                </span>
+                            </div>
+                            <div class="worknoon-status-item">
+                                <span class="worknoon-status-label"><?php _e('Database:', 'worknoon-chat'); ?></span>
+                                <span class="worknoon-status-badge worknoon-status-ok"><?php _e('Connected', 'worknoon-chat'); ?></span>
+                            </div>
+                        </div>
+                        <button type="button" class="button" id="worknoon-refresh-status">
+                            <?php _e('Refresh Status', 'worknoon-chat'); ?>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <input type="hidden" id="worknoon-admin-nonce" value="<?php echo wp_create_nonce('worknoon_chat_admin'); ?>">
+        </div>
+        <?php
+    }
+
+    /**
+     * Ensure admin user is authenticated with backend
+     */
+    private function ensure_admin_authenticated() {
+        $user_id = get_current_user_id();
+        if (!$user_id) return;
+
+        $jwt_token = get_user_meta($user_id, '_worknoon_jwt_token', true);
+        $backend_id = get_user_meta($user_id, '_worknoon_backend_id', true);
+
+        if (empty($jwt_token) || empty($backend_id)) {
+            // Auto-sync admin user to backend (this handles registration + login)
+            $this->sync_user_to_backend($user_id);
+
+            // Re-check if we now have a token
+            $jwt_token = get_user_meta($user_id, '_worknoon_jwt_token', true);
+
+            // If still no token, try explicit login
+            if (empty($jwt_token)) {
+                $user = get_userdata($user_id);
+                if ($user) {
+                    $this->authenticate_with_backend($user->user_login, $user);
+                }
+            }
+        }
+    }
+
+    /**
+     * Get chat statistics from backend
+     */
+    private function get_chat_statistics() {
+        $user_id = get_current_user_id();
+        $jwt_token = get_user_meta($user_id, '_worknoon_jwt_token', true);
+
+        if (empty($jwt_token)) {
+            return array();
+        }
+
+        // Get conversations count
+        $response = $this->make_backend_request('/conversations', 'GET', null, $jwt_token);
+        if (!is_wp_error($response)) {
+            $body = json_decode(wp_remote_retrieve_body($response), true);
+            // Backend returns data directly or in data property
+            $conversations = $body['data'] ?? $body ?? array();
+            if (isset($conversations['conversations'])) {
+                $conversations = $conversations['conversations'];
+            }
+
+            $total = count($conversations);
+            $unread = 0;
+            foreach ($conversations as $conv) {
+                $unread += $conv['unreadCount'] ?? 0;
+            }
+
+            return array(
+                'total_conversations' => $total,
+                'unread_messages' => $unread,
+                'active_users' => $this->get_active_users_count(),
+                'avg_response_time' => '2m 30s', // Placeholder
+            );
+        }
+
+        return array();
+    }
+
+    /**
+     * Get active users count (placeholder)
+     */
+    private function get_active_users_count() {
+        // This would ideally come from backend
+        return count(get_users(array('role__in' => array('administrator', 'shop_manager'))));
+    }
+
+    /**
+     * Render Conversations Page
+     */
+    public function render_conversations_page() {
+        $this->ensure_admin_authenticated();
+        ?>
+        <div class="wrap worknoon-admin-conversations">
+            <h1><?php _e('All Conversations', 'worknoon-chat'); ?></h1>
+
+            <div class="worknoon-conversations-toolbar">
+                <div class="worknoon-filters">
+                    <select id="worknoon-filter-status">
+                        <option value=""><?php _e('All Status', 'worknoon-chat'); ?></option>
+                        <option value="active"><?php _e('Active', 'worknoon-chat'); ?></option>
+                        <option value="closed"><?php _e('Closed', 'worknoon-chat'); ?></option>
+                        <option value="pending"><?php _e('Pending', 'worknoon-chat'); ?></option>
+                    </select>
+
+                    <select id="worknoon-filter-type">
+                        <option value=""><?php _e('All Types', 'worknoon-chat'); ?></option>
+                        <option value="buyer-agent"><?php _e('Support', 'worknoon-chat'); ?></option>
+                        <option value="buyer-designer"><?php _e('Designer', 'worknoon-chat'); ?></option>
+                        <option value="buyer-merchant"><?php _e('Merchant', 'worknoon-chat'); ?></option>
+                    </select>
+
+                    <input type="text" id="worknoon-search-conversations" placeholder="<?php _e('Search conversations...', 'worknoon-chat'); ?>">
+                </div>
+
+                <button type="button" class="button button-primary" id="worknoon-refresh-conversations">
+                    <?php _e('Refresh', 'worknoon-chat'); ?>
+                </button>
+            </div>
+
+            <div class="worknoon-conversations-layout">
+                <div class="worknoon-conversations-list-panel">
+                    <div id="worknoon-all-conversations" class="worknoon-conversations-list-full">
+                        <p class="worknoon-loading"><?php _e('Loading conversations...', 'worknoon-chat'); ?></p>
+                    </div>
+                </div>
+
+                <div class="worknoon-chat-panel" id="worknoon-admin-chat-panel" style="display: none;">
+                    <div class="worknoon-chat-header">
+                        <h3 id="worknoon-chat-participant-name"><?php _e('Select a conversation', 'worknoon-chat'); ?></h3>
+                        <span id="worknoon-chat-status" class="worknoon-status-badge"></span>
+                    </div>
+
+                    <div id="worknoon-admin-chat-messages" class="worknoon-admin-chat-messages">
+                        <p class="worknoon-select-conversation"><?php _e('Select a conversation to view messages', 'worknoon-chat'); ?></p>
+                    </div>
+
+                    <div class="worknoon-chat-input-area">
+                        <textarea id="worknoon-admin-message-input" rows="3" placeholder="<?php _e('Type your message...', 'worknoon-chat'); ?>"></textarea>
+                        <div class="worknoon-chat-actions">
+                            <button type="button" class="button" id="worknoon-admin-attach-btn">
+                                <?php _e('Attach File', 'worknoon-chat'); ?>
+                            </button>
+                            <button type="button" class="button button-primary" id="worknoon-admin-send-btn">
+                                <?php _e('Send', 'worknoon-chat'); ?>
+                            </button>
+                        </div>
+                    </div>
+
+                    <input type="hidden" id="worknoon-current-conversation-id">
+                </div>
+            </div>
+
+            <input type="hidden" id="worknoon-admin-nonce" value="<?php echo wp_create_nonce('worknoon_chat_admin'); ?>">
+            <input type="hidden" id="worknoon-current-user-id" value="<?php echo get_user_meta(get_current_user_id(), '_worknoon_backend_id', true); ?>">
+        </div>
+        <?php
+    }
+
+    /**
+     * Render Users Page
+     */
+    public function render_users_page() {
+        $this->ensure_admin_authenticated();
+
+        // Get users from backend
+        $users = $this->get_backend_users();
+        ?>
+        <div class="wrap worknoon-admin-users">
+            <h1><?php _e('Chat Users', 'worknoon-chat'); ?></h1>
+
+            <div class="worknoon-users-toolbar">
+                <div class="worknoon-user-filters">
+                    <select id="worknoon-filter-user-role">
+                        <option value=""><?php _e('All Roles', 'worknoon-chat'); ?></option>
+                        <option value="admin"><?php _e('Admins', 'worknoon-chat'); ?></option>
+                        <option value="agent"><?php _e('Agents', 'worknoon-chat'); ?></option>
+                        <option value="designer"><?php _e('Designers', 'worknoon-chat'); ?></option>
+                        <option value="merchant"><?php _e('Merchants', 'worknoon-chat'); ?></option>
+                        <option value="customer"><?php _e('Customers', 'worknoon-chat'); ?></option>
+                    </select>
+
+                    <input type="text" id="worknoon-search-users" placeholder="<?php _e('Search users...', 'worknoon-chat'); ?>">
+                </div>
+
+                <button type="button" class="button button-primary" id="worknoon-sync-users">
+                    <?php _e('Sync WordPress Users', 'worknoon-chat'); ?>
+                </button>
+            </div>
+
+            <table class="wp-list-table widefat fixed striped worknoon-users-table">
+                <thead>
+                    <tr>
+                        <th><?php _e('User', 'worknoon-chat'); ?></th>
+                        <th><?php _e('Role', 'worknoon-chat'); ?></th>
+                        <th><?php _e('Status', 'worknoon-chat'); ?></th>
+                        <th><?php _e('Conversations', 'worknoon-chat'); ?></th>
+                        <th><?php _e('Last Active', 'worknoon-chat'); ?></th>
+                        <th><?php _e('Actions', 'worknoon-chat'); ?></th>
+                    </tr>
+                </thead>
+                <tbody id="worknoon-users-list">
+                    <?php if (!empty($users)) : ?>
+                        <?php foreach ($users as $user) : ?>
+                            <tr>
+                                <td>
+                                    <div class="worknoon-user-info">
+                                        <span class="worknoon-user-avatar"><?php echo esc_html(substr($user['name'] ?? $user['email'], 0, 1)); ?></span>
+                                        <div>
+                                            <strong><?php echo esc_html($user['name'] ?? 'Unknown'); ?></strong>
+                                            <br><small><?php echo esc_html($user['email']); ?></small>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td>
+                                    <span class="worknoon-role-badge worknoon-role-<?php echo esc_attr($user['role']); ?>">
+                                        <?php echo esc_html(ucfirst($user['role'])); ?>
+                                    </span>
+                                </td>
+                                <td>
+                                    <?php if (!empty($user['status']['isOnline'])) : ?>
+                                        <span class="worknoon-status-online">🟢 <?php _e('Online', 'worknoon-chat'); ?></span>
+                                    <?php else : ?>
+                                        <span class="worknoon-status-offline">⚪ <?php _e('Offline', 'worknoon-chat'); ?></span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo number_format($user['conversationCount'] ?? 0); ?></td>
+                                <td><?php echo esc_html($this->format_last_active($user['status']['lastActive'] ?? null)); ?></td>
+                                <td>
+                                    <a href="#" class="button button-small worknoon-view-user" data-user-id="<?php echo esc_attr($user['_id']); ?>">
+                                        <?php _e('View', 'worknoon-chat'); ?>
+                                    </a>
+                                    <a href="<?php echo admin_url('admin.php?page=worknoon-chat-conversations&user=' . esc_attr($user['_id'])); ?>" class="button button-small">
+                                        <?php _e('Chats', 'worknoon-chat'); ?>
+                                    </a>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php else : ?>
+                        <tr>
+                            <td colspan="6"><?php _e('No users found. Click "Sync WordPress Users" to import users.', 'worknoon-chat'); ?></td>
+                        </tr>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+
+            <input type="hidden" id="worknoon-admin-nonce" value="<?php echo wp_create_nonce('worknoon_chat_admin'); ?>">
+        </div>
+        <?php
+    }
+
+    /**
+     * Get users from backend
+     */
+    private function get_backend_users() {
+        $user_id = get_current_user_id();
+        $jwt_token = get_user_meta($user_id, '_worknoon_jwt_token', true);
+
+        if (empty($jwt_token)) {
+            return array();
+        }
+
+        $response = $this->make_backend_request('/users', 'GET', null, $jwt_token);
+        if (!is_wp_error($response)) {
+            $body = json_decode(wp_remote_retrieve_body($response), true);
+            // Backend returns data directly or in data property
+            $users = $body['data'] ?? $body ?? array();
+            if (isset($users['users'])) {
+                $users = $users['users'];
+            }
+            return $users;
+        }
+
+        return array();
+    }
+
+    /**
+     * Format last active time
+     */
+    private function format_last_active($timestamp) {
+        if (empty($timestamp)) return __('Never', 'worknoon-chat');
+
+        $time = strtotime($timestamp);
+        $diff = time() - $time;
+
+        if ($diff < 60) return __('Just now', 'worknoon-chat');
+        if ($diff < 3600) return sprintf(__('%d minutes ago', 'worknoon-chat'), floor($diff / 60));
+        if ($diff < 86400) return sprintf(__('%d hours ago', 'worknoon-chat'), floor($diff / 3600));
+        return date('M j, Y', $time);
+    }
+
+    /**
+     * Render Analytics Page
+     */
+    public function render_analytics_page() {
+        $stats = $this->get_chat_statistics();
+        ?>
+        <div class="wrap worknoon-admin-analytics">
+            <h1><?php _e('Chat Analytics', 'worknoon-chat'); ?></h1>
+
+            <div class="worknoon-analytics-grid">
+                <div class="worknoon-card">
+                    <h2><?php _e('Message Volume', 'worknoon-chat'); ?></h2>
+                    <div class="worknoon-chart-placeholder">
+                        <p><?php _e('Chart: Messages per day (last 30 days)', 'worknoon-chat'); ?></p>
+                    </div>
+                </div>
+
+                <div class="worknoon-card">
+                    <h2><?php _e('Response Times', 'worknoon-chat'); ?></h2>
+                    <div class="worknoon-chart-placeholder">
+                        <p><?php _e('Chart: Average response time by hour', 'worknoon-chat'); ?></p>
+                    </div>
+                </div>
+
+                <div class="worknoon-card">
+                    <h2><?php _e('Top Agents', 'worknoon-chat'); ?></h2>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead>
+                            <tr>
+                                <th><?php _e('Agent', 'worknoon-chat'); ?></th>
+                                <th><?php _e('Conversations', 'worknoon-chat'); ?></th>
+                                <th><?php _e('Avg Response', 'worknoon-chat'); ?></th>
+                                <th><?php _e('Rating', 'worknoon-chat'); ?></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td colspan="4"><?php _e('Analytics data will appear here', 'worknoon-chat'); ?></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="worknoon-card">
+                    <h2><?php _e('Conversation Types', 'worknoon-chat'); ?></h2>
+                    <div class="worknoon-chart-placeholder">
+                        <p><?php _e('Chart: Distribution by conversation type', 'worknoon-chat'); ?></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <?php
     }
 
     /**
@@ -517,12 +1124,13 @@ class Worknoon_Chat {
             check_admin_referer('worknoon_chat_settings');
 
             $settings = array(
-                'enable_chat'       => isset($_POST['enable_chat']),
-                'allow_guest_chat'  => isset($_POST['allow_guest_chat']),
-                'email_notifications'=> isset($_POST['email_notifications']),
-                'primary_color'     => sanitize_hex_color($_POST['primary_color']),
-                'position'          => sanitize_text_field($_POST['position']),
-                'api_endpoint'      => esc_url_raw($_POST['api_endpoint']),
+                'enable_chat'           => isset($_POST['enable_chat']),
+                'allow_guest_chat'      => isset($_POST['allow_guest_chat']),
+                'email_notifications'   => isset($_POST['email_notifications']),
+                'primary_color'         => sanitize_hex_color($_POST['primary_color']),
+                'position'              => sanitize_text_field($_POST['position']),
+                'api_endpoint'          => esc_url_raw($_POST['api_endpoint']),
+                'socket_endpoint'       => esc_url_raw($_POST['socket_endpoint']),
             );
 
             update_option('worknoon_chat_settings', $settings);
@@ -579,15 +1187,28 @@ class Worknoon_Chat {
                         </td>
                     </tr>
                     <tr>
-                        <th><?php _e('External API Endpoint', 'worknoon-chat'); ?></th>
+                        <th><?php _e('Backend API Endpoint', 'worknoon-chat'); ?></th>
                         <td>
-                            <input type="url" name="api_endpoint" value="<?php echo esc_attr($settings['api_endpoint'] ?? ''); ?>" class="regular-text">
-                            <p class="description"><?php _e('Optional: Connect to external Node.js chat server', 'worknoon-chat'); ?></p>
+                            <input type="url" name="api_endpoint" value="<?php echo esc_attr($settings['api_endpoint'] ?? 'http://localhost:5001/api'); ?>" class="regular-text">
+                            <p class="description"><?php _e('Node.js backend API URL (e.g., http://localhost:5001/api)', 'worknoon-chat'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Socket.IO Endpoint', 'worknoon-chat'); ?></th>
+                        <td>
+                            <input type="url" name="socket_endpoint" value="<?php echo esc_attr($settings['socket_endpoint'] ?? 'http://localhost:5001'); ?>" class="regular-text">
+                            <p class="description"><?php _e('Socket.IO server URL for real-time messaging', 'worknoon-chat'); ?></p>
                         </td>
                     </tr>
                 </table>
                 <?php submit_button(__('Save Settings', 'worknoon-chat'), 'primary', 'save_worknoon_settings'); ?>
             </form>
+
+            <h2><?php _e('API Test', 'worknoon-chat'); ?></h2>
+            <p>
+                <button type="button" class="button" id="test-api-connection"><?php _e('Test Connection', 'worknoon-chat'); ?></button>
+                <span id="api-test-result"></span>
+            </p>
         </div>
         <?php
     }
@@ -597,24 +1218,27 @@ class Worknoon_Chat {
      */
     public function render_chat_widget($atts) {
         $atts = shortcode_atts(array(
-            'session_id' => 0,
+            'conversation_id' => '',
         ), $atts);
 
         ob_start();
         ?>
-        <div id="worknoon-chat-widget" class="worknoon-chat-widget" data-session-id="<?php echo esc_attr($atts['session_id']); ?>">
+        <div id="worknoon-chat-widget" class="worknoon-chat-widget" data-conversation-id="<?php echo esc_attr($atts['conversation_id']); ?>">
             <div class="chat-widget-container">
-                <div class="chat-header">
-                    <h3><?php _e('Chat Support', 'worknoon-chat'); ?></h3>
-                    <button class="chat-toggle"><?php _e('Close', 'worknoon-chat'); ?></button>
-                </div>
-                <div class="chat-messages" id="chat-messages"></div>
-                <div class="chat-input">
-                    <textarea id="chat-message-input" placeholder="<?php _e('Type your message...', 'worknoon-chat'); ?>"></textarea>
-                    <button id="chat-send-btn"><?php _e('Send', 'worknoon-chat'); ?></button>
+                <div class="chat-content">
+                    <!-- Content will be dynamically rendered by JavaScript -->
+                    <div class="chat-loading">
+                        <div class="chat-spinner"></div>
+                        <p>Loading...</p>
+                    </div>
                 </div>
             </div>
-            <button class="chat-fab"><?php _e('Chat', 'worknoon-chat'); ?></button>
+            <button class="chat-fab" aria-label="<?php _e('Open chat', 'worknoon-chat'); ?>">
+                <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+                <span class="chat-notification-badge" id="chat-notification-badge" style="display: none;">0</span>
+            </button>
         </div>
         <?php
         return ob_get_clean();
@@ -625,74 +1249,12 @@ class Worknoon_Chat {
      */
     public function render_chat_button($atts) {
         $atts = shortcode_atts(array(
-            'text' => __('Start Chat', 'worknoon-chat'),
-            'agent_id' => 0,
+            'text'      => __('Start Chat', 'worknoon-chat'),
+            'agent_id'  => '',
+            'type'      => 'buyer-agent',
         ), $atts);
 
-        return '<button class="worknoon-chat-btn" data-agent-id="' . esc_attr($atts['agent_id']) . '">' . esc_html($atts['text']) . '</button>';
-    }
-
-    /**
-     * AJAX: Send message
-     */
-    public function ajax_send_message() {
-        check_ajax_referer('worknoon_chat_nonce', 'nonce');
-
-        $session_id = intval($_POST['session_id']);
-        $content = sanitize_textarea_field($_POST['content']);
-        $user_id = get_current_user_id();
-
-        if (!$user_id) {
-            wp_send_json_error('User not logged in');
-        }
-
-        $message = array(
-            'id'            => uniqid('msg_'),
-            'sender_id'     => $user_id,
-            'sender_name'   => $this->get_user_display_name($user_id),
-            'content'       => $content,
-            'timestamp'     => current_time('mysql'),
-        );
-
-        $messages = get_post_meta($session_id, '_chat_messages', true);
-        if (!is_array($messages)) {
-            $messages = array();
-        }
-
-        $messages[] = $message;
-        update_post_meta($session_id, '_chat_messages', $messages);
-
-        wp_send_json_success($message);
-    }
-
-    /**
-     * AJAX: Send message (non-logged in users)
-     */
-    public function ajax_nopriv_send_message() {
-        wp_send_json_error('Please log in to send messages');
-    }
-
-    /**
-     * AJAX: Get messages
-     */
-    public function ajax_get_messages() {
-        check_ajax_referer('worknoon_chat_nonce', 'nonce');
-
-        $session_id = intval($_POST['session_id']);
-        $messages = get_post_meta($session_id, '_chat_messages', true);
-
-        if (!is_array($messages)) {
-            $messages = array();
-        }
-
-        wp_send_json_success($messages);
-    }
-
-    /**
-     * AJAX: Get messages (non-logged in users)
-     */
-    public function ajax_nopriv_get_messages() {
-        wp_send_json_error('Please log in to view messages');
+        return '<button class="worknoon-chat-btn" data-agent-id="' . esc_attr($atts['agent_id']) . '" data-type="' . esc_attr($atts['type']) . '">' . esc_html($atts['text']) . '</button>';
     }
 
     /**
@@ -700,10 +1262,13 @@ class Worknoon_Chat {
      */
     public function add_chat_to_order_page($order) {
         $order_id = $order->get_id();
-        $session_id = $this->get_or_create_order_chat_session($order_id);
+        $user_id = get_current_user_id();
+
+        // Create or get conversation for this order
+        $conversation_id = $this->get_or_create_order_conversation($order_id, $user_id);
 
         echo '<h2>' . __('Order Chat', 'worknoon-chat') . '</h2>';
-        echo do_shortcode('[worknoon_chat session_id="' . $session_id . '"]');
+        echo do_shortcode('[worknoon_chat conversation_id="' . $conversation_id . '"]');
     }
 
     /**
@@ -719,41 +1284,46 @@ class Worknoon_Chat {
         $product_id = $product->get_id();
         echo '<div class="product-chat-section">';
         echo '<h3>' . __('Questions about this product?', 'worknoon-chat') . '</h3>';
-        echo do_shortcode('[worknoon_chat_button text="' . __('Chat with us', 'worknoon-chat') . '"]');
+        echo '<button class="worknoon-chat-btn" data-product-id="' . esc_attr($product_id) . '" data-type="buyer-merchant">' . __('Chat with us', 'worknoon-chat') . '</button>';
         echo '</div>';
     }
 
     /**
-     * Get or create chat session for order
+     * Get or create order conversation
      */
-    private function get_or_create_order_chat_session($order_id) {
-        $session_id = get_post_meta($order_id, '_chat_session_id', true);
+    private function get_or_create_order_conversation($order_id, $user_id) {
+        // Check for existing conversation
+        $conversation_id = get_post_meta($order_id, '_worknoon_conversation_id', true);
+        if ($conversation_id) {
+            return $conversation_id;
+        }
 
-        if ($session_id) {
-            return $session_id;
+        // Create new conversation via backend
+        $backend_id = get_user_meta($user_id, '_worknoon_backend_id', true);
+        if (!$backend_id) {
+            return '';
         }
 
         $order = wc_get_order($order_id);
-        $user_id = $order->get_user_id();
+        $response = $this->make_backend_request('/conversations', 'POST', array(
+            'participantIds' => array(
+                array('userId' => $backend_id, 'role' => 'customer'),
+                array('userId' => 'agent', 'role' => 'agent'), // Will be assigned by backend
+            ),
+            'type' => 'buyer-agent',
+            'orderId' => $order_id,
+        ));
 
-        $session_data = array(
-            'post_title'    => sprintf(__('Order #%d Chat', 'worknoon-chat'), $order_id),
-            'post_type'     => 'chat_session',
-            'post_status'   => 'publish',
-            'post_author'   => $user_id ?: 1,
-        );
-
-        $session_id = wp_insert_post($session_data);
-
-        if (!is_wp_error($session_id)) {
-            update_post_meta($session_id, '_chat_participants', array($user_id));
-            update_post_meta($session_id, '_chat_status', 'active');
-            update_post_meta($session_id, '_chat_type', 'order');
-            update_post_meta($session_id, '_wc_order_id', $order_id);
-            update_post_meta($order_id, '_chat_session_id', $session_id);
+        if (!is_wp_error($response)) {
+            $body = json_decode(wp_remote_retrieve_body($response), true);
+            if (!empty($body['data']['conversation']['_id'])) {
+                $conversation_id = $body['data']['conversation']['_id'];
+                update_post_meta($order_id, '_worknoon_conversation_id', $conversation_id);
+                return $conversation_id;
+            }
         }
 
-        return $session_id;
+        return '';
     }
 
     /**
@@ -765,14 +1335,174 @@ class Worknoon_Chat {
 
         // Create default settings
         $default_settings = array(
-            'enable_chat'       => true,
-            'allow_guest_chat'  => false,
-            'email_notifications'=> true,
-            'primary_color'     => '#4f46e5',
-            'position'          => 'bottom-right',
+            'enable_chat'           => true,
+            'allow_guest_chat'      => false,
+            'email_notifications'   => true,
+            'primary_color'         => '#4f46e5',
+            'position'              => 'bottom-right',
+            'api_endpoint'          => 'http://localhost:5001/api',
+            'socket_endpoint'       => 'http://localhost:5001',
         );
 
         add_option('worknoon_chat_settings', $default_settings);
+    }
+
+    /**
+     * AJAX test connection handler
+     */
+    public function ajax_test_connection() {
+        check_ajax_referer('worknoon_chat_nonce', 'nonce');
+
+        $settings = get_option('worknoon_chat_settings', array());
+        $api_endpoint = $settings['api_endpoint'] ?? 'http://localhost:5001/api';
+
+        // Test by calling the health endpoint or users endpoint
+        $response = $this->make_backend_request('/health', 'GET');
+
+        if (is_wp_error($response)) {
+            wp_send_json_error('Connection failed: ' . $response->get_error_message());
+        }
+
+        $status_code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+
+        if ($status_code >= 200 && $status_code < 300) {
+            wp_send_json_success('Connected successfully to ' . $api_endpoint);
+        } else {
+            wp_send_json_error('Connection failed with status code: ' . $status_code);
+        }
+    }
+
+    /**
+     * AJAX sync all WordPress users to backend
+     */
+    public function ajax_sync_users() {
+        check_ajax_referer('worknoon_chat_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Permission denied');
+            return;
+        }
+
+        // Get all users with roles that should be synced
+        $users = get_users(array(
+            'role__in' => array('administrator', 'shop_manager', 'customer', 'subscriber', 'contributor', 'author'),
+            'number' => -1,
+        ));
+
+        $synced = 0;
+        $failed = 0;
+
+        foreach ($users as $user) {
+            $this->sync_user_to_backend($user->ID);
+
+            // Check if sync was successful by verifying backend ID exists
+            $backend_id = get_user_meta($user->ID, '_worknoon_backend_id', true);
+            if ($backend_id) {
+                $synced++;
+            } else {
+                $failed++;
+            }
+        }
+
+        // Also sync current admin user to ensure they have a token
+        $current_user_id = get_current_user_id();
+        $this->sync_user_to_backend($current_user_id);
+        $this->authenticate_with_backend('', get_userdata($current_user_id));
+
+        wp_send_json_success(array(
+            'message' => sprintf('Synced %d users successfully. %d failed.', $synced, $failed),
+            'synced' => $synced,
+            'failed' => $failed,
+        ));
+    }
+
+    /**
+     * AJAX file upload handler
+     */
+    public function ajax_handle_file_upload() {
+        check_ajax_referer('worknoon_chat_nonce', 'nonce');
+
+        // Check if file was uploaded
+        if (!isset($_FILES['file']) || empty($_FILES['file']['tmp_name'])) {
+            wp_send_json_error('No file uploaded');
+            return;
+        }
+
+        $file = $_FILES['file'];
+
+        // Validate file size (5MB max)
+        if ($file['size'] > 5 * 1024 * 1024) {
+            wp_send_json_error('File is too large. Maximum size is 5MB.');
+            return;
+        }
+
+        // Get JWT token
+        $token = isset($_POST['token']) ? sanitize_text_field($_POST['token']) : '';
+        if (empty($token)) {
+            $user_id = get_current_user_id();
+            if ($user_id) {
+                $token = get_user_meta($user_id, '_worknoon_jwt_token', true);
+            }
+        }
+
+        if (empty($token)) {
+            wp_send_json_error('Authentication required');
+            return;
+        }
+
+        // Upload to backend using wp_remote_post with proper multipart handling
+        $upload_url = $this->api_base_url . '/upload/single';
+
+        // Use WordPress HTTP API with proper file upload
+        $file_path = $file['tmp_name'];
+        $file_name = $file['name'];
+        $file_type = $file['type'];
+
+        // Create a temporary file with proper content
+        $temp_file = wp_tempnam($file_name);
+        copy($file_path, $temp_file);
+
+        $file_data = array(
+            'file' => new CURLFile($temp_file, $file_type, $file_name)
+        );
+
+        // Use cURL for proper multipart upload
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $upload_url);
+        curl_setopt($ch, CURLOPT_POST, 1);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, array(
+            'file' => new CURLFile($temp_file, $file_type, $file_name)
+        ));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+            'Authorization: Bearer ' . $token
+        ));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+
+        $response_body = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curl_error = curl_error($ch);
+        curl_close($ch);
+
+        // Clean up temp file
+        @unlink($temp_file);
+
+        if ($curl_error) {
+            wp_send_json_error('Upload failed: ' . $curl_error);
+            return;
+        }
+
+        if ($http_code >= 200 && $http_code < 300) {
+            $data = json_decode($response_body, true);
+            if (isset($data['data'])) {
+                wp_send_json_success($data['data']);
+            } else {
+                wp_send_json_success($data);
+            }
+        } else {
+            wp_send_json_error('Upload failed with status: ' . $http_code . ' - ' . $response_body);
+        }
     }
 
     /**
