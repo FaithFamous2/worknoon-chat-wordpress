@@ -8,7 +8,7 @@ cd worknoon-chat-backend
 npm install
 npm run dev
 ```
-Backend will run at `http://localhost:5000`
+Backend will run at `http://localhost:5001`
 
 ### Step 2: Install WordPress Plugin
 1. Copy `worknoon-chat-wordpress` folder to `/wp-content/plugins/`
@@ -16,8 +16,8 @@ Backend will run at `http://localhost:5000`
 
 ### Step 3: Configure Plugin
 1. Go to **Chat Sessions → Settings**
-2. Set Backend API Endpoint: `http://localhost:5000/api`
-3. Set Socket.IO Endpoint: `http://localhost:5000`
+2. Set Backend API Endpoint: `http://localhost:5001/api`
+3. Set Socket.IO Endpoint: `http://localhost:5001`
 4. Click **Save Settings**
 5. Click **Test Connection** to verify
 
@@ -78,8 +78,8 @@ Or add to your theme template:
 
 ### Local Development
 ```
-Backend API: http://localhost:5000/api
-Socket.IO:   http://localhost:5000
+Backend API: http://localhost:5001/api
+Socket.IO:   http://localhost:5001
 ```
 
 ### Production with Domain

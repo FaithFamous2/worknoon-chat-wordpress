@@ -33,8 +33,8 @@ In WordPress Admin, go to **Chat Sessions → Settings**:
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| Backend API Endpoint | Node.js API URL | `http://localhost:5000/api` |
-| Socket.IO Endpoint | Socket server URL | `http://localhost:5000` |
+| Backend API Endpoint | Node.js API URL | `http://localhost:5001/api` |
+| Socket.IO Endpoint | Socket server URL | `http://localhost:5001` |
 | Enable Chat | Show widget on frontend | Enabled |
 | Allow Guest Chat | Anonymous users can chat | Disabled |
 | Primary Color | Widget accent color | `#4f46e5` |
